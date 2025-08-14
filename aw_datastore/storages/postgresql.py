@@ -36,6 +36,7 @@ from aw_core.models import Event
 from .abstract import AbstractStorage
 
 
+
 CREATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS buckets (
     rowid    BIGSERIAL PRIMARY KEY,
@@ -62,6 +63,8 @@ CREATE INDEX IF NOT EXISTS event_index_endtime   ON events(bucketrow, endtime);
 -- Extra index aiding ORDER BY endtime DESC
 CREATE INDEX IF NOT EXISTS event_index_bucket_endtime_desc ON events(bucketrow, endtime DESC);
 """
+_SCHEMA_LOCK_KEY1 = 0x41_57  # любые стабильные int32
+_SCHEMA_LOCK_KEY2 = 0x53_43
 
 MAX_TIMESTAMP = 2**63 - 1  # keep parity with sqlite backend
 
@@ -96,12 +99,24 @@ class PostgresqlStorage(AbstractStorage):
         self._cache_lock = threading.RLock()
 
         # гарантируем схему (через временный коннект из пула)
-        with self._getconn() as conn, conn.cursor() as cur:
-            conn.autocommit = True
-            cur.execute(CREATE_SCHEMA)
+        tmp = psycopg2.connect(self.dsn)
+        try:
+            tmp.autocommit = True
+            with tmp.cursor() as cur:
+                # блокируемся: только один процесс выполняет DDL
+                cur.execute("SELECT pg_advisory_lock(%s, %s);", (_SCHEMA_LOCK_KEY1, _SCHEMA_LOCK_KEY2))
+                try:
+                    cur.execute(CREATE_SCHEMA)
+                finally:
+                    cur.execute("SELECT pg_advisory_unlock(%s, %s);", (_SCHEMA_LOCK_KEY1, _SCHEMA_LOCK_KEY2))
 
-        # прогреваем кэш
-        self._refresh_bucket_cache()
+                # прогреем кэш бакетов НЕ через пул (чтобы не создать пул в мастере)
+                cur.execute("SELECT id, rowid FROM buckets")
+                rows = cur.fetchall()
+                with self._cache_lock:
+                    self._bucket_cache = {bid: int(rid) for bid, rid in rows}
+        finally:
+            tmp.close()
 
     # ---------- pool/fork safety ----------
     def _ensure_pool(self) -> None:
