@@ -1,32 +1,36 @@
-# aw_datastore/storages/postgresql.py (optimized, peewee-compatible semantics)
+# aw_datastore/storages/postgresql.py
 """
-PostgreSQL storage backend for ActivityWatch, aligned with peewee/sqlite logic
-and tuned for better query/insert performance.
+PostgreSQL storage backend for ActivityWatch, aligned with peewee/sqlite logic,
+pool-safe for multi-process/multi-thread/greenlet concurrency.
 
-Key differences vs previous version:
-- insert_many() now mirrors peewee: updates events with preset IDs, bulk-inserts the rest
-- get_events() trims edge events to [start,end] exactly (like peewee)
-- replace() and replace_last() now return the updated Event and set event.id (peewee semantics)
-- delete() returns number of removed rows (peewee semantics)
-- Caches bucket id -> rowid lookups (major speedup on hot paths)
-- Adds an index matching ORDER BY endtime DESC for faster pagination
-- Uses execute_values with page_size for efficient bulk inserts
-
-Optional DB-level optimizations you can run manually (not required):
-  CREATE INDEX IF NOT EXISTS event_index_bucket_endtime_desc
-    ON events (bucketrow, endtime DESC);
-  -- For heavy range queries you may also consider range indexing (see README/notes)
+Key improvements vs single-connection version:
+- ThreadedConnectionPool instead of a single global connection (self.conn).
+- Lazy and fork-safe pool creation (works with gunicorn --preload).
+- Per-operation connection usage: one connection/cursor per method call.
+- Thread-safe bucket cache with locks.
+- Optional psycogreen patch for gevent (if installed).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import psycopg2
 from psycopg2.extras import execute_values
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2 import InterfaceError, OperationalError
+from psycopg2.pool import PoolError
+# Для gevent (опционально): даёт кооперативные PG-запросы
+try:
+    import psycogreen.gevent  # type: ignore
+    psycogreen.gevent.patch_psycopg()
+except Exception:
+    pass
 
 from aw_core.models import Event
 from .abstract import AbstractStorage
@@ -67,52 +71,139 @@ class PostgresqlStorage(AbstractStorage):
 
     def __init__(self, testing: bool, dsn: Optional[str] = None) -> None:
         self.testing = testing
-        self.dsn = dsn or os.environ.get("POSTGRES_DSN")
-        if not self.dsn:
+        base_dsn = dsn or os.environ.get("POSTGRES_DSN")
+        if not base_dsn:
             raise ValueError("POSTGRES_DSN must be provided or pass dsn=...")
 
-        # One connection per process; callers should manage concurrency at a higher level
-        self.conn = psycopg2.connect(self.dsn)
-        self.conn.autocommit = True
+        # опциональные параметры: application_name и TCP keepalive
+        appname = os.getenv("PGCLIENT_APPNAME", "aw-server")
+        keepalive = "keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=5"
+        # не дублируем, если уже есть
+        extra = []
+        if "application_name=" not in base_dsn:
+            extra.append(f"application_name={appname}")
+        if "keepalives=" not in base_dsn:
+            extra.append(keepalive)
+        self.dsn = base_dsn + (" " + " ".join(extra) if extra else "")
 
-        with self.conn.cursor() as cur:
+        # пул пока не создаём — лениво, чтобы быть форк-безопасными
+        self._pool: Optional[ThreadedConnectionPool] = None
+        self._pool_lock = threading.RLock()
+        self._pid = os.getpid()
+
+        # потокобезопасный кэш bucket_id -> rowid
+        self._bucket_cache: Dict[str, int] = {}
+        self._cache_lock = threading.RLock()
+
+        # гарантируем схему (через временный коннект из пула)
+        with self._getconn() as conn, conn.cursor() as cur:
+            conn.autocommit = True
             cur.execute(CREATE_SCHEMA)
 
-        # cache: bucket_id -> rowid
-        self._bucket_cache: Dict[str, int] = {}
+        # прогреваем кэш
         self._refresh_bucket_cache()
 
-    # --- helpers -------------------------------------------------------------
-    def commit(self):  # compatibility shim
+    # ---------- pool/fork safety ----------
+    def _ensure_pool(self) -> None:
+        """Создаёт/пересоздаёт пул, учитывая fork."""
+        cur_pid = os.getpid()
+        if self._pool is not None and cur_pid == self._pid:
+            return
+        with self._pool_lock:
+            cur_pid = os.getpid()
+            if self._pool is not None and cur_pid == self._pid:
+                return
+            # закрываем прежний пул (если был унаследован форком)
+            if self._pool is not None:
+                try:
+                    self._pool.closeall()
+                except Exception:
+                    pass
+                self._pool = None
+            minconn = int(os.getenv("PGPOOL_MIN", "1"))
+            maxconn = int(os.getenv("PGPOOL_MAX", "20"))
+            self._pool = ThreadedConnectionPool(minconn=minconn, maxconn=maxconn, dsn=self.dsn)
+            self._pid = cur_pid
+
+    @contextmanager
+    def _getconn(self):
+        """Даёт connection из пула на время операции, с автоматическим возвратом.
+        В случае InterfaceError/OperationalError пул будет пересоздан,
+        исключение пробрасывается — вызывающий код может повторить операцию при необходимости.
+        """
+        self._ensure_pool()
+        assert self._pool is not None
+        conn = self._pool.getconn()
+
+        # Если пул вернул закрытый коннект — заменить на живой
+        if getattr(conn, "closed", 0):
+            try:
+                self._pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            conn = self._pool.getconn()
+
+        # единообразно включим autocommit (если тебе нужно)
         try:
-            self.conn.commit()
+            conn.autocommit = True
         except Exception:
             pass
 
+        try:
+            yield conn
+        except (InterfaceError, OperationalError):
+            # битый коннект — удаляем из пула, но пул НЕ закрываем
+            try:
+                self._pool.putconn(conn, close=True)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            # пусть вызывающий код поднимет исключение выше — на следующем вызове мы получим новый коннект
+            raise
+        else:
+            # штатный путь: вернуть коннект в пул
+            try:
+                self._pool.putconn(conn)
+            except PoolError:
+                # пул закрыт конкаррентно — просто закрываем коннект
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # ---------- shims ----------
+    def commit(self):  # compatibility shim, no-op with autocommit
+        pass
+
+    # ---------- bucket cache ----------
     def _refresh_bucket_cache(self) -> None:
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute("SELECT id, rowid FROM buckets")
-            self._bucket_cache = {bid: int(rid) for bid, rid in cur.fetchall()}
+            rows = cur.fetchall()
+        with self._cache_lock:
+            self._bucket_cache = {bid: int(rid) for bid, rid in rows}
 
     def _bucket_rowid(self, bucket_id: str) -> int:
-        rid = self._bucket_cache.get(bucket_id)
+        with self._cache_lock:
+            rid = self._bucket_cache.get(bucket_id)
         if rid is not None:
             return rid
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute("SELECT rowid FROM buckets WHERE id=%s", (bucket_id,))
             row = cur.fetchone()
-            if not row:
-                raise ValueError(f"Bucket '{bucket_id}' does not exist")
-            rid = int(row[0])
+        if not row:
+            raise ValueError(f"Bucket '{bucket_id}' does not exist")
+        rid = int(row[0])
+        with self._cache_lock:
             self._bucket_cache[bucket_id] = rid
-            return rid
+        return rid
 
-    # --- buckets metadata ----------------------------------------------------
+    # ---------- buckets metadata ----------
     def buckets(self):
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT id,name,type,client,hostname,created,datastr FROM buckets"
-            )
+        with self._getconn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id,name,type,client,hostname,created,datastr FROM buckets")
             rows = cur.fetchall()
         return {
             r[0]: {
@@ -137,15 +228,17 @@ class PostgresqlStorage(AbstractStorage):
         name: Optional[str] = None,
         data: Optional[dict] = None,
     ):
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
+            conn.autocommit = True
             cur.execute(
                 """INSERT INTO buckets(id,name,type,client,hostname,created,datastr)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s)
-                       ON CONFLICT (id) DO NOTHING""",
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (id) DO NOTHING""",
                 (bucket_id, name, type_id, client, hostname, created, json.dumps(data or {})),
             )
-        # refresh cache lazily; only when newly created
-        self._bucket_cache.pop(bucket_id, None)
+        # обновим/сбросим кэш
+        with self._cache_lock:
+            self._bucket_cache.pop(bucket_id, None)
         return self.get_metadata(bucket_id)
 
     def update_bucket(
@@ -172,38 +265,40 @@ class PostgresqlStorage(AbstractStorage):
         if not updates:
             raise ValueError("At least one field must be updated.")
         values.append(bucket_id)
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(f"UPDATE buckets SET {', '.join(updates)} WHERE id=%s", values)
+        # кэш менять не нужно (rowid не меняется), но если хочешь — можно сбросить:
+        # with self._cache_lock: self._bucket_cache.pop(bucket_id, None)
         return self.get_metadata(bucket_id)
 
     def delete_bucket(self, bucket_id: str):
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute("DELETE FROM buckets WHERE id=%s", (bucket_id,))
             if cur.rowcount != 1:
                 raise ValueError("Bucket did not exist, could not delete")
-        # ensure cache consistency
-        self._bucket_cache.pop(bucket_id, None)
+        with self._cache_lock:
+            self._bucket_cache.pop(bucket_id, None)
 
     def get_metadata(self, bucket_id: str):
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT id,name,type,client,hostname,created,datastr FROM buckets WHERE id=%s",
                 (bucket_id,),
             )
             row = cur.fetchone()
-            if not row:
-                raise ValueError("Bucket did not exist, could not get metadata")
-            return {
-                "id": row[0],
-                "name": row[1],
-                "type": row[2],
-                "client": row[3],
-                "hostname": row[4],
-                "created": row[5],
-                "data": json.loads(row[6] or "{}"),
-            }
+        if not row:
+            raise ValueError("Bucket did not exist, could not get metadata")
+        return {
+            "id": row[0],
+            "name": row[1],
+            "type": row[2],
+            "client": row[3],
+            "hostname": row[4],
+            "created": row[5],
+            "data": json.loads(row[6] or "{}"),
+        }
 
-    # --- events --------------------------------------------------------------
+    # ---------- events ----------
     @staticmethod
     def _to_us(micros_dt: datetime) -> int:
         return int(micros_dt.timestamp() * 1_000_000)
@@ -212,10 +307,10 @@ class PostgresqlStorage(AbstractStorage):
         s = self._to_us(event.timestamp)
         e = s + int(event.duration.total_seconds() * 1_000_000)
         rid = self._bucket_rowid(bucket_id)
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO events(bucketrow,starttime,endtime,datastr)
-                       VALUES (%s,%s,%s,%s) RETURNING id""",
+                   VALUES (%s,%s,%s,%s) RETURNING id""",
                 (rid, s, e, json.dumps(event.data)),
             )
             event.id = int(cur.fetchone()[0])
@@ -226,22 +321,19 @@ class PostgresqlStorage(AbstractStorage):
             return
         rid = self._bucket_rowid(bucket_id)
 
-        # 1) Updates (events that have explicit IDs)
         updates = [e for e in events if e.id is not None]
         if updates:
-            with self.conn.cursor() as cur:
-                # Use pipeline of UPDATEs; could be optimized further via temp table if needed
+            with self._getconn() as conn, conn.cursor() as cur:
                 for ev in updates:
                     s = self._to_us(ev.timestamp)
                     e = s + int(ev.duration.total_seconds() * 1_000_000)
                     cur.execute(
                         """UPDATE events
-                               SET bucketrow=%s, starttime=%s, endtime=%s, datastr=%s
-                               WHERE id=%s""",
+                           SET bucketrow=%s, starttime=%s, endtime=%s, datastr=%s
+                           WHERE id=%s""",
                         (rid, s, e, json.dumps(ev.data), ev.id),
                     )
 
-        # 2) Inserts (events without IDs) — bulk insert with execute_values
         to_insert = [e for e in events if e.id is None]
         if to_insert:
             rows = []
@@ -249,7 +341,7 @@ class PostgresqlStorage(AbstractStorage):
                 s = self._to_us(ev.timestamp)
                 e = s + int(ev.duration.total_seconds() * 1_000_000)
                 rows.append((rid, s, e, json.dumps(ev.data)))
-            with self.conn.cursor() as cur:
+            with self._getconn() as conn, conn.cursor() as cur:
                 execute_values(
                     cur,
                     "INSERT INTO events (bucketrow,starttime,endtime,datastr) VALUES %s",
@@ -259,7 +351,7 @@ class PostgresqlStorage(AbstractStorage):
 
     def delete(self, bucket_id: str, event_id: int) -> int:
         rid = self._bucket_rowid(bucket_id)
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute("DELETE FROM events WHERE id=%s AND bucketrow=%s", (event_id, rid))
             return int(cur.rowcount)
 
@@ -267,11 +359,11 @@ class PostgresqlStorage(AbstractStorage):
         rid = self._bucket_rowid(bucket_id)
         s = self._to_us(event.timestamp)
         e = s + int(event.duration.total_seconds() * 1_000_000)
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(
                 """UPDATE events
-                       SET bucketrow=%s, starttime=%s, endtime=%s, datastr=%s
-                       WHERE id=%s""",
+                   SET bucketrow=%s, starttime=%s, endtime=%s, datastr=%s
+                   WHERE id=%s""",
                 (rid, s, e, json.dumps(event.data), event_id),
             )
         event.id = event_id
@@ -281,14 +373,14 @@ class PostgresqlStorage(AbstractStorage):
         rid = self._bucket_rowid(bucket_id)
         s = self._to_us(event.timestamp)
         e = s + int(event.duration.total_seconds() * 1_000_000)
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(
                 """UPDATE events
-                       SET starttime=%s, endtime=%s, datastr=%s
-                       WHERE id = (
-                         SELECT id FROM events WHERE bucketrow=%s
-                         ORDER BY endtime DESC LIMIT 1
-                       ) RETURNING id""",
+                   SET starttime=%s, endtime=%s, datastr=%s
+                   WHERE id = (
+                     SELECT id FROM events WHERE bucketrow=%s
+                     ORDER BY endtime DESC LIMIT 1
+                   ) RETURNING id""",
                 (s, e, json.dumps(event.data), rid),
             )
             row = cur.fetchone()
@@ -298,11 +390,11 @@ class PostgresqlStorage(AbstractStorage):
 
     def get_event(self, bucket_id: str, event_id: int) -> Optional[Event]:
         rid = self._bucket_rowid(bucket_id)
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(
                 """SELECT id,starttime,endtime,datastr
-                       FROM events
-                      WHERE bucketrow=%s AND id=%s""",
+                   FROM events
+                  WHERE bucketrow=%s AND id=%s""",
                 (rid, event_id),
             )
             row = cur.fetchone()
@@ -339,7 +431,7 @@ class PostgresqlStorage(AbstractStorage):
         else:
             sql = base_sql
 
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
 
@@ -350,7 +442,6 @@ class PostgresqlStorage(AbstractStorage):
             ev = Event(id=eid, timestamp=start, duration=end - start, data=json.loads(ds))
             events.append(ev)
 
-        # Trim to [starttime, endtime] like peewee does
         if starttime or endtime:
             for ev in events:
                 if starttime and ev.timestamp < starttime:
@@ -371,10 +462,10 @@ class PostgresqlStorage(AbstractStorage):
         rid = self._bucket_rowid(bucket_id)
         s_i = int(starttime.timestamp() * 1_000_000) if starttime else 0
         e_i = int(endtime.timestamp() * 1_000_000) if endtime else MAX_TIMESTAMP
-        with self.conn.cursor() as cur:
+        with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(
                 """SELECT COUNT(1) FROM events
-                       WHERE bucketrow=%s AND endtime >= %s AND starttime <= %s""",
+                   WHERE bucketrow=%s AND endtime >= %s AND starttime <= %s""",
                 (rid, s_i, e_i),
             )
             return int(cur.fetchone()[0])
