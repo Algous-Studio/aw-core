@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     type     TEXT NOT NULL,
     client   TEXT NOT NULL,
     hostname TEXT NOT NULL,
-    created  TEXT NOT NULL,
+    created  TIMESTAMPTZ NOT NULL,
     datastr  TEXT NOT NULL
 );
 
@@ -62,6 +62,7 @@ CREATE INDEX IF NOT EXISTS event_index_starttime ON events(bucketrow, starttime)
 CREATE INDEX IF NOT EXISTS event_index_endtime   ON events(bucketrow, endtime);
 -- Extra index aiding ORDER BY endtime DESC
 CREATE INDEX IF NOT EXISTS event_index_bucket_endtime_desc ON events(bucketrow, endtime DESC);
+CREATE INDEX IF NOT EXISTS event_index_bucket_starttime_desc ON events(bucketrow, starttime DESC);
 """
 _SCHEMA_LOCK_KEY1 = 0x41_57  # любые стабильные int32
 _SCHEMA_LOCK_KEY2 = 0x53_43
@@ -227,7 +228,7 @@ class PostgresqlStorage(AbstractStorage):
                 "type": r[2],
                 "client": r[3],
                 "hostname": r[4],
-                "created": r[5],
+                "created": r[5].astimezone(timezone.utc).isoformat(),
                 "data": json.loads(r[6] or "{}"),
             }
             for r in rows
@@ -244,7 +245,6 @@ class PostgresqlStorage(AbstractStorage):
         data: Optional[dict] = None,
     ):
         with self._getconn() as conn, conn.cursor() as cur:
-            conn.autocommit = True
             cur.execute(
                 """INSERT INTO buckets(id,name,type,client,hostname,created,datastr)
                    VALUES (%s,%s,%s,%s,%s,%s,%s)
@@ -309,7 +309,7 @@ class PostgresqlStorage(AbstractStorage):
             "type": row[2],
             "client": row[3],
             "hostname": row[4],
-            "created": row[5],
+            "created": row[5].astimezone(timezone.utc).isoformat(),
             "data": json.loads(row[6] or "{}"),
         }
 
@@ -344,9 +344,9 @@ class PostgresqlStorage(AbstractStorage):
                     e = s + int(ev.duration.total_seconds() * 1_000_000)
                     cur.execute(
                         """UPDATE events
-                           SET bucketrow=%s, starttime=%s, endtime=%s, datastr=%s
-                           WHERE id=%s""",
-                        (rid, s, e, json.dumps(ev.data), ev.id),
+                           SET starttime=%s, endtime=%s, datastr=%s
+                           WHERE id=%s AND bucketrow=%s""",
+                        (s, e, json.dumps(ev.data), ev.id, rid),
                     )
 
         to_insert = [e for e in events if e.id is None]
@@ -377,9 +377,9 @@ class PostgresqlStorage(AbstractStorage):
         with self._getconn() as conn, conn.cursor() as cur:
             cur.execute(
                 """UPDATE events
-                   SET bucketrow=%s, starttime=%s, endtime=%s, datastr=%s
-                   WHERE id=%s""",
-                (rid, s, e, json.dumps(event.data), event_id),
+                   SET starttime=%s, endtime=%s, datastr=%s
+                   WHERE id=%s AND bucketrow=%s""",
+                (s, e, json.dumps(event.data), event_id, rid),
             )
         event.id = event_id
         return event
@@ -388,20 +388,55 @@ class PostgresqlStorage(AbstractStorage):
         rid = self._bucket_rowid(bucket_id)
         s = self._to_us(event.timestamp)
         e = s + int(event.duration.total_seconds() * 1_000_000)
-        with self._getconn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """UPDATE events
-                   SET starttime=%s, endtime=%s, datastr=%s
-                   WHERE id = (
-                     SELECT id FROM events WHERE bucketrow=%s
-                     ORDER BY endtime DESC LIMIT 1
-                   ) RETURNING id""",
-                (s, e, json.dumps(event.data), rid),
-            )
-            row = cur.fetchone()
-        if row:
-            event.id = int(row[0])
-        return event
+
+        with self._getconn() as conn:
+            old_ac = conn.autocommit
+            conn.autocommit = False
+            try:
+                with conn.cursor() as cur:
+                    # Лочим реальную "последнюю по окончанию" запись этого бакета
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM events
+                        WHERE bucketrow=%s
+                        ORDER BY endtime DESC
+                        LIMIT 1
+                        FOR UPDATE
+                        """,
+                        (rid,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        last_id = int(row[0])
+                        cur.execute(
+                            """
+                            UPDATE events
+                            SET starttime=%s, endtime=%s, datastr=%s
+                            WHERE id=%s
+                            """,
+                            (s, e, json.dumps(event.data), last_id),
+                        )
+                        event.id = last_id
+                    else:
+                        # если бакет пуст — вставляем первую запись
+                        cur.execute(
+                            """
+                            INSERT INTO events (bucketrow, starttime, endtime, datastr)
+                            VALUES (%s, %s, %s, %s)
+                            RETURNING id
+                            """,
+                            (rid, s, e, json.dumps(event.data)),
+                        )
+                        event.id = int(cur.fetchone()[0])
+                conn.commit()
+                return event
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.autocommit = old_ac
+
 
     def get_event(self, bucket_id: str, event_id: int) -> Optional[Event]:
         rid = self._bucket_rowid(bucket_id)
@@ -418,7 +453,7 @@ class PostgresqlStorage(AbstractStorage):
         eid, s_i, e_i, ds = row
         start = datetime.fromtimestamp(s_i / 1_000_000, tz=timezone.utc)
         end = datetime.fromtimestamp(e_i / 1_000_000, tz=timezone.utc)
-        return Event(id=eid, timestamp=start, duration=end - start, data=json.loads(ds))
+        return Event(id=eid, timestamp=start, duration=(end - start), data=json.loads(ds))
 
     def get_events(
         self,
@@ -454,7 +489,7 @@ class PostgresqlStorage(AbstractStorage):
         for eid, s_us, e_us, ds in rows:
             start = datetime.fromtimestamp(s_us / 1_000_000, tz=timezone.utc)
             end = datetime.fromtimestamp(e_us / 1_000_000, tz=timezone.utc)
-            ev = Event(id=eid, timestamp=start, duration=end - start, data=json.loads(ds))
+            ev = Event(id=eid, timestamp=start, duration=(end - start), data=json.loads(ds))
             events.append(ev)
 
         if starttime or endtime:
